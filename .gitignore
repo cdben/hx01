@@ -1,0 +1,22 @@
+# 编译产物
+*.o
+*.a
+*.so
+
+# 可执行文件
+server/server
+client/client
+admin/admin
+
+# 调试符号
+*.dSYM/
+
+# macOS 系统文件
+.DS_Store
+
+# 编辑器/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
