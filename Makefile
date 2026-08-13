@@ -56,8 +56,16 @@ client/client: client/client.c $(COMMON_OBJ)
 	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS)
 
 # --- 管理端 ---
-admin/admin: admin/admin.c $(COMMON_OBJ)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS)
+ADMIN_OBJ = admin/history.o admin/term.o
+
+admin/history.o: admin/history.c admin/history.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+admin/term.o: admin/term.c admin/term.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+admin/admin: admin/admin.c $(COMMON_OBJ) $(ADMIN_OBJ)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJ) $(ADMIN_OBJ) -o $@ $(LDFLAGS)
 
 # ============================================================
 #  运行命令

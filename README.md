@@ -98,13 +98,14 @@ Select client (number, client_id, or :quit): 1
 - `cd` 会改变目录，效果持久化（客户端维护 `cwd`，每次命令从上次目录出发）
 - 命令执行成功时不显示退出码，失败时显示 `[exit: N]`
 - 长命令执行期间显示 `[running... Enter to cancel]`，按回车即可取消
-- `:quit` 或 `:q` 返回客户端列表
+- `:quit` 或 `:q` 返回客户端列表；`:exit` 或 `:e` 退出管理端程序
 
 Shell 模式内置命令：
 
 | 命令      | 说明 |
 |-----------|------|
 | `:quit` / `:q` | 返回客户端列表 |
+| `:exit` / `:e` | 退出管理端程序 |
 | `:help` / `:h` | 显示帮助 |
 | `:list` / `:l` | 刷新并显示客户端列表 |
 | `:push <local> <remote>` | 上传本地文件到客户端（原 `:upload`） |
@@ -285,14 +286,14 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 ├── client/            # 客户端（被控端）
 │   └── client.c       # 反向连接、注册、fork/exec 执行命令（CWD 追踪，支持取消）、心跳、重连
 └── admin/             # 管理端
-    ├── admin.c        # 交互式控制台（列表选择 + shell 模式）
+    ├── admin.c        # 交互式控制台（列表选择 + shell 模式 + 行编辑输入）
     ├── history.h      # 命令历史管理（环形缓冲，方向键浏览）
     ├── history.c      # 历史记录实现
     ├── term.h         # 终端 raw 模式控制声明
     └── term.c         # termios raw 模式实现
 ```
 
-> 注：`admin/history.*` 和 `admin/term.*` 已实现命令历史与终端 raw 模式，但尚未接入 `admin.c`，当前管理端使用 `fgets` 行缓冲输入。Makefile 暂未编译这两个模块。
+> `admin/history.*` 提供命令历史环形缓冲，`admin/term.*` 提供终端 raw 模式；`admin.c` 中 `read_line()` 进入 raw 模式逐字节读取按键，接入 ↑/↓ 历史浏览与 ←/→ 光标移动、Backspace、Ctrl+A/E/K/U 行编辑。Makefile 已编译这两个模块（`admin/history.o`、`admin/term.o`）。
 
 ## 关键特性
 
@@ -306,6 +307,8 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 - ✅ **断线重连**（指数退避 1→2→4→...→60秒）
 - ✅ **请求ID匹配**（异步，管理端可连续发多条命令）
 - ✅ **粘包处理**（帧头含 length，按长度读取）
+- ✅ **文件传输**（`:push` 上传 / `:pull` 下载，分块传输 + 进度显示）
+- ✅ **行编辑与历史**（↑/↓ 浏览历史命令，←/→ 移动光标，Backspace/Ctrl+A/E/K/U 行编辑）
 - ✅ 跨平台（select 模型，macOS/Linux 通用）
 
 ## 后续改进方向
@@ -314,6 +317,6 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 - [ ] 客户端鉴权（预共享密钥或证书）
 - [ ] 管理端登录鉴权
 - [x] 客户端列表查询（`MSG_LIST` / `MSG_LIST_RESP`，管理端列表选择 + `:list` 命令）
-- [ ] 接入命令历史与方向键浏览（`admin/history.*`、`admin/term.*` 已实现，待接入 `admin.c` 并加入 Makefile）
+- [x] 命令历史与方向键浏览（↑/↓ 回调历史，←/→ 移动光标，Backspace/Ctrl+A/E/K/U 编辑，基于 `admin/history.*`、`admin/term.*`）
 - [ ] 命令审计日志
 - [x] 文件传输功能（`:push` 上传 / `:pull` 下载，支持分块传输与进度显示）

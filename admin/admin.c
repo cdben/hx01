@@ -28,6 +28,8 @@
 
 #include "protocol.h"
 #include "utils.h"
+#include "history.h"
+#include "term.h"
 
 #define MAX_CLIENT_LIST 256
 
@@ -200,6 +202,152 @@ static void free_client_list(char **list, int count)
 }
 
 /*
+ * 带行编辑的输入读取：进入 raw 模式，逐字节读按键，
+ * 支持 ←/→ 移动光标、Backspace/Delete、↑/↓ 浏览历史。
+ * 回车确认。返回值写入 buf（以 \0 结尾），返回 0 成功、-1 EOF。
+ * prompt 为提示符字符串，由本函数打印并参与整行重绘。
+ */
+static int read_line(char *buf, size_t size, history_t *hist, const char *prompt)
+{
+    size_t len = 0;       /* 已输入字符数 */
+    size_t pos = 0;       /* 光标位置（0..len） */
+    int c;
+
+    if (size == 0 || prompt == NULL) {
+        return 0;
+    }
+    printf("%s", prompt);   /* 打印提示符 */
+    fflush(stdout);
+
+    hist_reset_cursor(hist);
+
+    for (;;) {
+        fflush(stdout);
+        c = getchar();
+
+        if (c == EOF) {
+            return -1;
+        }
+
+        if (c == '\r' || c == '\n') {
+            buf[len] = '\0';
+            putchar('\n');
+            return 0;
+        }
+
+        if (c == 0x01) {  /* Ctrl+A: 行首 */
+            while (pos > 0) { putchar('\b'); pos--; }
+            continue;
+        }
+        if (c == 0x05) {  /* Ctrl+E: 行尾 */
+            while (pos < len) { putchar(buf[pos]); pos++; }
+            continue;
+        }
+        if (c == 0x0b) {  /* Ctrl+K: 删到行尾 */
+            size_t old = len;
+            len = pos;
+            buf[len] = '\0';
+            /* 用空格覆盖 pos..old，再回退到 pos */
+            for (size_t i = pos; i < old; i++) { putchar(' '); }
+            for (size_t i = pos; i < old; i++) { putchar('\b'); }
+            continue;
+        }
+        if (c == 0x15) {  /* Ctrl+U: 删到行首 */
+            size_t old = len;
+            memmove(buf, buf + pos, len - pos);
+            len -= pos;
+            pos = 0;
+            buf[len] = '\0';
+            /* 重绘：提示符 + buf，光标回到 pos=0 */
+            putchar('\r');
+            printf("%s%s", prompt, buf);
+            /* 清掉原 old 长度的残影 */
+            for (size_t i = len; i < old; i++) { putchar(' '); }
+            for (size_t i = len; i < old; i++) { putchar('\b'); }
+            continue;
+        }
+
+        if (c == 127 || c == 0x08) {  /* Backspace */
+            if (pos == 0) {
+                continue;
+            }
+            memmove(buf + pos - 1, buf + pos, len - pos);
+            len--;
+            pos--;
+            buf[len] = '\0';
+            printf("\b%s ", buf + pos);
+            for (size_t i = pos; i <= len; i++) {
+                putchar('\b');
+            }
+            continue;
+        }
+
+        if (c == 0x1b) {  /* ESC: 可能是方向键 */
+            int s1 = getchar();
+            int s2 = getchar();
+            if (s1 == EOF || s2 == EOF) {
+                continue;
+            }
+            if (s1 == '[') {
+                if (s2 == 'D') {  /* ← */
+                    if (pos > 0) { putchar('\b'); pos--; }
+                    continue;
+                }
+                if (s2 == 'C') {  /* → */
+                    if (pos < len) { putchar(buf[pos]); pos++; }
+                    continue;
+                }
+                if (s2 == 'A' || s2 == 'B') {  /* ↑/↓ */
+                    const char *entry = (s2 == 'A')
+                        ? hist_prev(hist) : hist_next(hist);
+                    if (entry == NULL) {
+                        if (s2 == 'B') {
+                            entry = "";  /* 下到最新：清空 */
+                        } else {
+                            continue;
+                        }
+                    }
+                    size_t old = len;
+                    size_t elen = strlen(entry);
+                    if (elen >= size) { elen = size - 1; }
+                    memcpy(buf, entry, elen);
+                    len = elen;
+                    pos = len;
+                    buf[len] = '\0';
+                    /* 重绘：提示符 + 新历史条目，光标到行尾(pos=len) */
+                    putchar('\r');
+                    printf("%s%s", prompt, buf);
+                    /* 清掉原 old 长度的残影（若历史条目更短） */
+                    for (size_t i = len; i < old; i++) { putchar(' '); }
+                    for (size_t i = len; i < old; i++) { putchar('\b'); }
+                    continue;
+                }
+                if (s2 == 'H') {  /* Home */
+                    while (pos > 0) { putchar('\b'); pos--; }
+                    continue;
+                }
+                if (s2 == 'F') {  /* End */
+                    while (pos < len) { putchar(buf[pos]); pos++; }
+                    continue;
+                }
+            }
+            continue;  /* 其他转义序列忽略 */
+        }
+
+        /* 普通可打印字符 */
+        if (c >= 0x20 && c < 0x7f && len < size - 1) {
+            memmove(buf + pos + 1, buf + pos, len - pos);
+            buf[pos] = (char)c;
+            len++;
+            buf[len] = '\0';
+            printf("%s", buf + pos);
+            pos++;
+            for (size_t i = pos; i < len; i++) { putchar('\b'); }
+        }
+    }
+}
+
+/*
  * 显示客户端列表并让用户选择。
  * 返回选中的 client_id（strdup 分配），调用方 free。
  * quit 参数：如果用户输入 :quit，*quit 设为 1 并返回 NULL。
@@ -264,11 +412,14 @@ static void print_shell_help(void)
 {
     printf("Shell commands:\n");
     printf("  :quit, :q    Return to client list\n");
+    printf("  :exit, :e    Exit the program\n");
     printf("  :help, :h    Show this help\n");
     printf("  :list, :l    Refresh and show client list\n");
     printf("  :push <local> <remote>        Upload local file to client\n");
     printf("  :pull <remote> <local>        Download client file to local\n");
     printf("  <cmd>        Execute command on the selected client\n");
+    printf("Line editing: Up/Down history, Left/Right move cursor,\n");
+    printf("              Ctrl+A/E line head/end, Ctrl+K/U kill to end/start\n");
 }
 
 /*
@@ -583,6 +734,11 @@ int main(int argc, char *argv[])
 
     printf("[admin] connected to server\n");
 
+    history_t hist;
+    hist_init(&hist);
+
+    int exit_prog = 0;   /* :exit 直接退出整个程序 */
+
     /* 主循环：列表选择 → shell 模式 */
     for (;;) {
         /* 获取客户端列表 */
@@ -673,20 +829,23 @@ retry_selection:
         }
 
         /* shell 循环 */
+        if (term_raw_enter() < 0) {
+            fprintf(stderr, "[admin] cannot enter raw mode: %s\n", strerror(errno));
+            free(selected);
+            free_client_list(client_list, client_count);
+            continue;
+        }
         for (;;) {
             char input[MAX_CMD_LEN + 32];
+            char prompt[64 + PATH_MAX];
 
-            printf("[%s:%s] $ ", selected, cwd);
-            fflush(stdout);
+            snprintf(prompt, sizeof(prompt), "[%s:%s] $ ", selected, cwd);
 
-            if (fgets(input, sizeof(input), stdin) == NULL) {
+            if (read_line(input, sizeof(input), &hist, prompt) < 0) {
                 /* EOF */
                 printf("\n");
                 break;
             }
-
-            /* 去掉末尾换行 */
-            input[strcspn(input, "\n")] = '\0';
 
             if (strlen(input) == 0) {
                 continue;
@@ -696,6 +855,12 @@ retry_selection:
             if (strcmp(input, ":quit") == 0 || strcmp(input, ":q") == 0) {
                 break;
             }
+            if (strcmp(input, ":exit") == 0 || strcmp(input, ":e") == 0) {
+                exit_prog = 1;
+                break;
+            }
+            /* 记入历史（:quit/:exit 除外），供 ↑/↓ 回调 */
+            hist_add(&hist, input);
             if (strcmp(input, ":help") == 0 || strcmp(input, ":h") == 0) {
                 print_shell_help();
                 continue;
@@ -811,8 +976,11 @@ retry_selection:
 
                     /* 用户按下 Enter → 取消 */
                     if (FD_ISSET(STDIN_FILENO, &rset)) {
-                        char cancel_buf[16];
-                        fgets(cancel_buf, sizeof(cancel_buf), stdin);
+                        /* raw 模式下逐字节读到回车/换行 */
+                        int ch;
+                        while ((ch = getchar()) != EOF && ch != '\n' && ch != '\r') {
+                            /* 丢弃缓冲中的字符 */
+                        }
 
                         /* 发送 CANCEL */
                         size_t cid_len = strlen(selected) + 1;
@@ -859,8 +1027,12 @@ retry_selection:
         }
 
 shell_break:
+        term_raw_exit();
         free(selected);
         free_client_list(client_list, client_count);
+        if (exit_prog) {
+            goto cleanup;
+        }
     }
 
 cleanup:
