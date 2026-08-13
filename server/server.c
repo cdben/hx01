@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -33,6 +34,8 @@
 #define LISTEN_BACKLOG 4096        /* listen backlog，应对瞬时并发重连 */
 #define EPOLL_EVENTS   1024        /* 单次 epoll_wait 取出的事件数 */
 #define READ_CHUNK     16384       /* 单次 read 尝试读取量 */
+#define SWEEP_INTERVAL 10          /* 超时扫描间隔（秒），epoll_wait 超时 */
+#define CLIENT_TIMEOUT 45          /* 客户端无活动超时（秒），3 个心跳周期 */
 
 /* 单条消息最大字节数：header + payload */
 #define MAX_MSG_SIZE   (HEADER_SIZE + MAX_PAYLOAD)
@@ -58,6 +61,7 @@ typedef struct {
     conn_type_t  type;
     char         client_id[MAX_CLIENT_ID];
     int          registered;
+    time_t       last_active;   /* 最后一次收到数据的时间，用于心跳超时 */
 
     /* 读缓冲：拼接未读完的半包 */
     uint8_t     *rbuf;          /* 读缓冲，容量 MAX_MSG_SIZE */
@@ -83,6 +87,7 @@ static void init_conns(void)
         conns[i].type = CONN_TYPE_UNKNOWN;
         conns[i].client_id[0] = '\0';
         conns[i].registered = 0;
+        conns[i].last_active = 0;
         conns[i].rbuf = NULL;
         conns[i].rlen = 0;
         conns[i].whead = NULL;
@@ -172,6 +177,7 @@ static void close_conn(int fd, int epfd)
     c->type = CONN_TYPE_UNKNOWN;
     c->client_id[0] = '\0';
     c->registered = 0;
+    c->last_active = 0;
     c->rbuf = NULL;
     c->rlen = 0;
 }
@@ -212,6 +218,7 @@ static void handle_new_connection(int listen_fd, int epfd)
         c->fd = fd;
         c->type = CONN_TYPE_UNKNOWN;
         c->registered = 0;
+        c->last_active = time(NULL);
         c->client_id[0] = '\0';
         c->rbuf = malloc(MAX_MSG_SIZE);
         if (c->rbuf == NULL) {
@@ -584,6 +591,7 @@ static void handle_client_data(int fd, int epfd)
             close_conn(fd, epfd);
             return;
         }
+        c->last_active = time(NULL);  /* 收到数据，刷新活跃时间 */
         c->rlen += (size_t)n;
 
         /* 尝试从 rbuf 中解析出尽可能多的完整消息 */
@@ -617,6 +625,25 @@ static void handle_client_data(int fd, int epfd)
                 memmove(c->rbuf, c->rbuf + msg_size, left);
             }
             c->rlen = left;
+        }
+    }
+}
+
+/* 扫描所有连接，清理超过 CLIENT_TIMEOUT 秒无活动的 client。
+ * admin 不做超时清理（管理端可能长时间只等结果不发包）。 */
+static void sweep_timeout(int epfd)
+{
+    time_t now = time(NULL);
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (conns[i].fd >= 0 && conns[i].type == CONN_TYPE_CLIENT &&
+            conns[i].registered) {
+            if (now - conns[i].last_active > CLIENT_TIMEOUT) {
+                printf("[server] client %s timeout (no activity %lds), closing\n",
+                       conns[i].client_id,
+                       (long)(now - conns[i].last_active));
+                close_conn(i, epfd);
+            }
         }
     }
 }
@@ -695,15 +722,21 @@ int main(int argc, char *argv[])
 
     struct epoll_event events[EPOLL_EVENTS];
 
-    /* 事件循环 */
+    /* 事件循环：epoll_wait 带 SWEEP_INTERVAL 秒超时，用于定期清理失联 client */
     for (;;) {
-        nfds = epoll_wait(epfd, events, EPOLL_EVENTS, -1);
+        nfds = epoll_wait(epfd, events, EPOLL_EVENTS, SWEEP_INTERVAL * 1000);
         if (nfds < 0) {
             if (errno == EINTR) {
                 continue;
             }
             perror("[server] epoll_wait");
             break;
+        }
+
+        if (nfds == 0) {
+            /* epoll_wait 超时：扫描清理失联 client */
+            sweep_timeout(epfd);
+            continue;
         }
 
         for (i = 0; i < nfds; i++) {
