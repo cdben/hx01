@@ -22,7 +22,7 @@ CFLAGS    = -Wall -Wextra -g -Icommon
 LDFLAGS   =
 
 # ---- 服务端配置 ----
-SERVER_HOST = 127.0.0.1
+SERVER_HOST = 172.16.115.144
 SERVER_PORT = 8888
 
 # ---- 客户端预设 ID ----
