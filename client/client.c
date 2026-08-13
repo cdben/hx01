@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <limits.h>
 
@@ -41,6 +42,9 @@ static char    *child_out     = NULL; /* 输出缓冲区 */
 static size_t   child_out_len = 0;
 static size_t   child_out_cap = 0;
 static uint32_t child_req_id  = 0;
+
+/* ---- 文件上传状态 ---- */
+static int upload_fd = -1;  /* 当前上传目标文件句柄（-1 表示未打开） */
 
 /* 启动并重置输出缓冲区 */
 static void output_buf_reset(void)
@@ -298,6 +302,28 @@ static void send_result(int sock_fd, const char *cwd, int exit_code,
     }
 
     output_buf_reset();
+}
+
+/* 发送文件传输应答：status 0 成功，负值为错误（errmsg 为描述）。 */
+static void send_file_ack(int sock_fd, uint32_t req_id, int status,
+                          const char *errmsg)
+{
+    uint8_t ack[256];
+    int32_t status_net = htonl(status);
+    const char *msg = errmsg != NULL ? errmsg : "";
+    size_t len = strlen(msg);
+    if (len > sizeof(ack) - 4 - 1) {
+        len = sizeof(ack) - 4 - 1;
+    }
+
+    memcpy(ack, &status_net, 4);
+    memcpy(ack + 4, msg, len);
+    ack[4 + len] = '\0';
+
+    if (send_message(sock_fd, MSG_FILE_ACK, req_id, ack,
+                     (uint32_t)(4 + len + 1)) < 0) {
+        fprintf(stderr, "[client] send FILE_ACK failed\n");
+    }
 }
 
 /* 连接到服务端，返回 fd 或 -1 */
@@ -693,6 +719,183 @@ int main(int argc, char *argv[])
                     }
                     break;
 
+                case MSG_FILE_UPLOAD: {
+                    /* 接收上传分块：payload = target_client_id\0 remote_path\0 file_meta_t data */
+                    const uint8_t *p = buf + HEADER_SIZE;
+                    uint32_t plen = payload_len;
+                    const uint8_t *after_id;
+                    const uint8_t *path_end;
+                    const uint8_t *meta;
+                    file_meta_t fm;
+                    const uint8_t *data;
+                    uint32_t data_len;
+                    char remote_path[PATH_MAX];
+                    size_t path_len;
+
+                    after_id = (const uint8_t *)memchr(p, '\0', plen);
+                    if (after_id == NULL) {
+                        break;
+                    }
+                    after_id++;
+
+                    /* 解析 remote_path（到下一个 \0） */
+                    path_end = (const uint8_t *)memchr(after_id, '\0',
+                        plen - (uint32_t)(after_id - p));
+                    if (path_end == NULL) {
+                        break;
+                    }
+                    path_len = (size_t)(path_end - after_id);
+                    if (path_len == 0 || path_len >= PATH_MAX) {
+                        break;
+                    }
+                    memcpy(remote_path, after_id, path_len);
+                    remote_path[path_len] = '\0';
+
+                    /* 解析 file_meta_t 与数据 */
+                    meta = path_end + 1;
+                    if ((uint32_t)(meta - p) + FILE_META_SIZE > plen) {
+                        break;
+                    }
+                    file_meta_unpack(meta, &fm);
+                    data = meta + FILE_META_SIZE;
+                    data_len = plen - (uint32_t)(data - p);
+
+                    /* 第一块：打开目标文件 */
+                    if (fm.offset == 0) {
+                        if (upload_fd >= 0) {
+                            close(upload_fd);
+                            upload_fd = -1;
+                        }
+                        upload_fd = open(remote_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                        if (upload_fd < 0) {
+                            send_file_ack(fd, req_id, -1, strerror(errno));
+                            printf("[client:%s] upload open failed: %s (%s)\n",
+                                   client_id, remote_path, strerror(errno));
+                            break;
+                        }
+                    }
+
+                    if (upload_fd < 0) {
+                        /* 句柄丢失（非第一块但未打开），报错 */
+                        send_file_ack(fd, req_id, -1, "upload not open");
+                        break;
+                    }
+
+                    /* 定位并写入 */
+                    if (lseek(upload_fd, fm.offset, SEEK_SET) < 0 ||
+                        write_full(upload_fd, data, data_len) != 0) {
+                        send_file_ack(fd, req_id, -1, strerror(errno));
+                        close(upload_fd);
+                        upload_fd = -1;
+                        break;
+                    }
+
+                    /* 每块都回 ACK（供管理端做流控），最后一块关闭文件 */
+                    if (fm.flags & FILE_FLAG_FINAL) {
+                        close(upload_fd);
+                        upload_fd = -1;
+                    }
+                    send_file_ack(fd, req_id, 0, NULL);
+                    if (fm.flags & FILE_FLAG_FINAL) {
+                        printf("[client:%s] upload complete: %s (%u bytes)\n",
+                               client_id, remote_path, fm.total_size);
+                    }
+                    break;
+                }
+
+                case MSG_FILE_DOWNLOAD: {
+                    /* 下载请求：payload = target_client_id\0 remote_path\0 */
+                    const uint8_t *p = buf + HEADER_SIZE;
+                    uint32_t plen = payload_len;
+                    const uint8_t *after_id;
+                    const uint8_t *pend = p + plen;
+                    const uint8_t *path_end;
+                    char remote_path[PATH_MAX];
+                    size_t path_len;
+                    int in_fd;
+                    struct stat st;
+                    uint32_t total;
+                    uint32_t off = 0;
+                    uint8_t chunk[FILE_META_SIZE + FILE_CHUNK_SIZE];
+
+                    after_id = (const uint8_t *)memchr(p, '\0', plen);
+                    if (after_id == NULL) {
+                        break;
+                    }
+                    after_id++;
+
+                    path_end = (const uint8_t *)memchr(after_id, '\0',
+                        (size_t)(pend - after_id));
+                    if (path_end == NULL) {
+                        path_len = (size_t)(pend - after_id);
+                    } else {
+                        path_len = (size_t)(path_end - after_id);
+                    }
+                    if (path_len == 0 || path_len >= PATH_MAX) {
+                        break;
+                    }
+                    memcpy(remote_path, after_id, path_len);
+                    remote_path[path_len] = '\0';
+
+                    in_fd = open(remote_path, O_RDONLY);
+                    if (in_fd < 0) {
+                        send_file_ack(fd, req_id, -1, strerror(errno));
+                        printf("[client:%s] download open failed: %s (%s)\n",
+                               client_id, remote_path, strerror(errno));
+                        break;
+                    }
+
+                    if (fstat(in_fd, &st) < 0) {
+                        send_file_ack(fd, req_id, -1, strerror(errno));
+                        close(in_fd);
+                        break;
+                    }
+                    total = (uint32_t)st.st_size;
+
+                    /* 流式读文件并分块回传 */
+                    for (;;) {
+                        ssize_t n = read(in_fd, chunk + FILE_META_SIZE, FILE_CHUNK_SIZE);
+                        if (n < 0) {
+                            send_file_ack(fd, req_id, -1, strerror(errno));
+                            break;
+                        }
+                        if (n == 0) {
+                            /* 空文件：发一个 FINAL 空块 */
+                            if (total == 0) {
+                                file_meta_t em = { 0, 0, FILE_FLAG_FINAL };
+                                file_meta_pack(chunk, &em);
+                                send_message(fd, MSG_FILE_DATA, req_id, chunk,
+                                             FILE_META_SIZE);
+                            }
+                            break;
+                        }
+
+                        off += (uint32_t)n;
+                        {
+                            file_meta_t fm;
+                            fm.offset = off - (uint32_t)n;
+                            fm.total_size = total;
+                            fm.flags = (off >= total) ? FILE_FLAG_FINAL : 0;
+                            file_meta_pack(chunk, &fm);
+                        }
+
+                        if (send_message(fd, MSG_FILE_DATA, req_id, chunk,
+                                         (uint32_t)(FILE_META_SIZE + n)) < 0) {
+                            send_file_ack(fd, req_id, -1, strerror(errno));
+                            break;
+                        }
+
+                        if (off >= total) {
+                            break;
+                        }
+                    }
+
+                    close(in_fd);
+                    printf("[client:%s] download sent: %s (%u bytes)\n",
+                           client_id, remote_path, total);
+                    break;
+                }
+
                 case MSG_HEARTBEAT_ACK:
                     /* 心跳回复，忽略 */
                     break;
@@ -708,6 +911,10 @@ int main(int argc, char *argv[])
         /* 连接断开，清理子进程 */
         kill_child();
         output_buf_reset();
+        if (upload_fd >= 0) {
+            close(upload_fd);
+            upload_fd = -1;
+        }
 
         close(fd);
         if (registered) {

@@ -91,7 +91,10 @@ static void close_conn(int fd)
     conns[fd].registered = 0;
 }
 
-/* 处理新连接：accept、设非阻塞、初始化 conns[fd] */
+/* 处理新连接：accept、初始化 conns[fd]
+ * 注：连接 socket 保持阻塞模式——recv_message/send_message 内部用
+ * read_full/write_full 循环读写，阻塞模式才能正确处理被 TCP 拆分的
+ * 大消息（如 64KB 的文件分块）。只有 listen socket 设为非阻塞（见 main）。 */
 static void handle_new_connection(int listen_fd)
 {
     struct sockaddr_in addr;
@@ -116,12 +119,6 @@ static void handle_new_connection(int listen_fd)
             continue;
         }
 
-        if (set_nonblock(fd) < 0) {
-            perror("[server] set_nonblock");
-            close(fd);
-            continue;
-        }
-
         conns[fd].fd = fd;
         conns[fd].type = CONN_TYPE_UNKNOWN;
         conns[fd].registered = 0;
@@ -130,6 +127,37 @@ static void handle_new_connection(int listen_fd)
         printf("[server] new connection: fd=%d from %s:%d\n",
                fd, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
+}
+
+/* 将文件传输消息（UPLOAD/DOWNLOAD）按 payload 首段 client_id 路由转发到目标客户端；
+ * 目标不存在时向管理端回 MSG_ERROR。 */
+static void forward_file_to_client(int fd, msg_type_t type, uint32_t req_id,
+                                   const uint8_t *payload, uint32_t payload_len)
+{
+    const char *target_id;
+    int target_fd;
+
+    if (memchr(payload, '\0', payload_len) == NULL) {
+        fprintf(stderr, "[server] malformed file msg (no separator) from fd=%d\n", fd);
+        return;
+    }
+
+    target_id = (const char *)payload;
+    target_fd = find_client_by_id(target_id);
+    if (target_fd < 0) {
+        char errmsg[MAX_CLIENT_ID + 32];
+        int elen = snprintf(errmsg, sizeof(errmsg),
+                            "client '%s' not found", target_id);
+        send_message(fd, MSG_ERROR, req_id, errmsg, (uint32_t)elen + 1);
+        printf("[server] file transfer: client %s NOT FOUND\n", target_id);
+        return;
+    }
+
+    if (send_message(target_fd, type, req_id, payload, payload_len) < 0) {
+        perror("[server] forward file msg");
+    }
+    printf("[server] admin -> client %s file transfer (%s)\n",
+           target_id, msg_type_str(type));
 }
 
 /* 处理已有连接的数据：recv_message 后按消息类型分发 */
@@ -144,6 +172,8 @@ static void handle_client_data(int fd)
 
     ret = recv_message(fd, buf, sizeof(buf), &type, &req_id, NULL, &payload_len);
     if (ret < 0) {
+        fprintf(stderr, "[server] recv_message failed fd=%d errno=%d (%s)\n",
+                fd, errno, strerror(errno));
         close_conn(fd);
         return;
     }
@@ -282,6 +312,36 @@ static void handle_client_data(int fd)
             perror("[server] forward CANCEL");
         }
         printf("[server] CANCEL forwarded to client %s\n", target_id);
+        break;
+    }
+
+    case MSG_FILE_UPLOAD:
+    case MSG_FILE_DOWNLOAD:
+        /* 管理端发来的文件传输请求：按 client_id 路由转发到目标客户端 */
+        conns[fd].type = CONN_TYPE_ADMIN;
+        forward_file_to_client(fd, type, req_id, payload, payload_len);
+        break;
+
+    case MSG_FILE_DATA:
+    case MSG_FILE_ACK: {
+        /* 客户端回传的文件数据/应答：广播给所有管理端 */
+        int i;
+        const char *cid = conns[fd].registered ? conns[fd].client_id : "unknown";
+
+        printf("[server] client %s -> admin %s (req_id=%u)\n",
+               cid, msg_type_str(type), req_id);
+
+        for (i = 0; i < MAX_CLIENTS; i++) {
+            if (i == fd) {
+                continue;
+            }
+            if (conns[i].fd >= 0 && conns[i].type == CONN_TYPE_ADMIN) {
+                if (send_message(conns[i].fd, type, req_id,
+                                 payload, payload_len) < 0) {
+                    perror("[server] forward file msg");
+                }
+            }
+        }
         break;
     }
 

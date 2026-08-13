@@ -96,6 +96,39 @@ static int recv_response(int fd, msg_type_t *type, uint32_t *req_id,
 }
 
 /*
+ * 接收文件传输相关的应答，仅当消息类型属于文件传输且 req_id 匹配时返回。
+ * 其余消息（其他 req_id、HEARTBEAT_ACK 等）跳过。
+ */
+static int recv_file_response(int fd, uint32_t expected_req_id,
+                              msg_type_t *type, uint8_t *payload_buf,
+                              size_t payload_buf_size, uint32_t *payload_len)
+{
+    uint8_t buf[HEADER_SIZE + MAX_PAYLOAD];
+
+    for (;;) {
+        msg_type_t t;
+        uint32_t rid;
+        uint32_t plen;
+
+        if (recv_message(fd, buf, sizeof(buf), &t, &rid, NULL, &plen) < 0) {
+            return -1;
+        }
+
+        if ((t == MSG_FILE_DATA || t == MSG_FILE_ACK || t == MSG_ERROR) &&
+            rid == expected_req_id) {
+            *type = t;
+            if (payload_buf != NULL && plen > 0) {
+                size_t copy_len = plen < payload_buf_size ? plen : payload_buf_size;
+                memcpy(payload_buf, buf + HEADER_SIZE, copy_len);
+            }
+            *payload_len = plen;
+            return 0;
+        }
+        /* 忽略无关消息 */
+    }
+}
+
+/*
  * 请求客户端列表，返回解析后的客户端 ID 数组（calloc 分配）。
  * count 写出客户端数量。调用方负责 free。
  */
@@ -233,6 +266,8 @@ static void print_shell_help(void)
     printf("  :quit, :q    Return to client list\n");
     printf("  :help, :h    Show this help\n");
     printf("  :list, :l    Refresh and show client list\n");
+    printf("  :push <local> <remote>        Upload local file to client\n");
+    printf("  :pull <remote> <local>        Download client file to local\n");
     printf("  <cmd>        Execute command on the selected client\n");
 }
 
@@ -289,6 +324,225 @@ static int parse_and_display_result(const uint8_t *payload, uint32_t payload_len
     }
 
     return 0;
+}
+
+/*
+ * 上传本地文件到客户端：分块发送，每块等待 ACK。
+ * payload = client_id\0 remote_path\0 file_meta_t data
+ */
+static void do_upload(int fd, const char *client_id, uint32_t req_id,
+                      const char *local_path, const char *remote_path)
+{
+    FILE *fp;
+    long total_long;
+    uint32_t total;
+    size_t id_len = strlen(client_id) + 1;
+    size_t path_len = strlen(remote_path) + 1;
+    size_t prefix_len = id_len + path_len + FILE_META_SIZE;
+    size_t chunk_cap;
+    uint8_t payload[MAX_PAYLOAD];
+    uint8_t *pmeta;
+    uint8_t *pdata;
+    uint32_t offset = 0;
+
+    fp = fopen(local_path, "rb");
+    if (fp == NULL) {
+        printf("[upload] cannot open local file '%s': %s\n",
+               local_path, strerror(errno));
+        return;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        printf("[upload] cannot seek '%s': %s\n", local_path, strerror(errno));
+        fclose(fp);
+        return;
+    }
+    total_long = ftell(fp);
+    if (total_long < 0) {
+        total_long = 0;
+    }
+    total = (uint32_t)total_long;
+    rewind(fp);
+
+    /* 前缀过长（client_id + remote_path）导致放不下数据时直接报错 */
+    if (prefix_len >= MAX_PAYLOAD) {
+        printf("[upload] client_id/path too long\n");
+        fclose(fp);
+        return;
+    }
+    chunk_cap = MAX_PAYLOAD - prefix_len;
+    if (chunk_cap > FILE_CHUNK_SIZE) {
+        chunk_cap = FILE_CHUNK_SIZE;
+    }
+
+    /* 固定前缀：client_id\0 remote_path\0，随后是 file_meta_t 与数据 */
+    memcpy(payload, client_id, id_len);
+    memcpy(payload + id_len, remote_path, path_len);
+    pmeta = payload + id_len + path_len;
+    pdata = pmeta + FILE_META_SIZE;
+
+    for (;;) {
+        size_t n = fread(pdata, 1, chunk_cap, fp);
+        file_meta_t fm;
+        fm.offset = offset;
+        fm.total_size = total;
+        fm.flags = (offset + (uint32_t)n >= total) ? FILE_FLAG_FINAL : 0;
+        file_meta_pack(pmeta, &fm);
+
+        uint32_t plen = (uint32_t)(pdata - payload) + (uint32_t)n;
+        if (send_message(fd, MSG_FILE_UPLOAD, req_id, payload, plen) < 0) {
+            printf("[upload] send failed: %s\n", strerror(errno));
+            fclose(fp);
+            return;
+        }
+        offset += (uint32_t)n;
+
+        /* 等待本块 ACK */
+        {
+            uint8_t resp[256];
+            msg_type_t type;
+            uint32_t rlen;
+
+            if (recv_file_response(fd, req_id, &type, resp, sizeof(resp),
+                                   &rlen) < 0) {
+                printf("[upload] connection lost\n");
+                fclose(fp);
+                return;
+            }
+
+            if (type == MSG_ERROR) {
+                printf("[upload] ERROR: %s\n", resp);
+                fclose(fp);
+                return;
+            }
+
+            if (type == MSG_FILE_ACK && rlen >= 4) {
+                int32_t status_net;
+                int status;
+                memcpy(&status_net, resp, 4);
+                status = (int)ntohl((uint32_t)status_net);
+                if (status != 0) {
+                    printf("[upload] failed: %s\n", resp + 4);
+                    fclose(fp);
+                    return;
+                }
+            }
+        }
+
+        printf("\r[upload] %u/%u bytes", offset, total);
+        fflush(stdout);
+
+        if (fm.flags & FILE_FLAG_FINAL) {
+            break;
+        }
+    }
+
+    fclose(fp);
+    printf("\n[upload] done: %s -> %s (%u bytes)\n",
+           local_path, remote_path, total);
+}
+
+/*
+ * 从客户端下载文件：发送请求后循环接收分块写盘。
+ */
+static void do_download(int fd, const char *client_id, uint32_t req_id,
+                        const char *remote_path, const char *local_path)
+{
+    size_t id_len = strlen(client_id) + 1;
+    size_t path_len = strlen(remote_path) + 1;
+    uint8_t req[MAX_CLIENT_ID + PATH_MAX];
+    FILE *fp;
+    uint32_t total = 0;
+    uint32_t received = 0;
+    uint8_t resp[FILE_META_SIZE + FILE_CHUNK_SIZE];
+    int ok = 0;
+
+    if (id_len + path_len > sizeof(req)) {
+        printf("[download] path too long\n");
+        return;
+    }
+    memcpy(req, client_id, id_len);
+    memcpy(req + id_len, remote_path, path_len);
+
+    if (send_message(fd, MSG_FILE_DOWNLOAD, req_id, req,
+                     (uint32_t)(id_len + path_len)) < 0) {
+        printf("[download] send failed: %s\n", strerror(errno));
+        return;
+    }
+
+    fp = fopen(local_path, "wb");
+    if (fp == NULL) {
+        printf("[download] cannot open local file '%s': %s\n",
+               local_path, strerror(errno));
+        return;
+    }
+
+    for (;;) {
+        msg_type_t type;
+        uint32_t rlen;
+
+        if (recv_file_response(fd, req_id, &type, resp, sizeof(resp),
+                               &rlen) < 0) {
+            printf("[download] connection lost\n");
+            break;
+        }
+
+        if (type == MSG_ERROR) {
+            printf("[download] ERROR: %s\n", resp);
+            break;
+        }
+
+        if (type == MSG_FILE_ACK) {
+            if (rlen >= 4) {
+                int32_t status_net;
+                int status;
+                memcpy(&status_net, resp, 4);
+                status = (int)ntohl((uint32_t)status_net);
+                if (status != 0) {
+                    printf("[download] failed: %s\n", resp + 4);
+                }
+            }
+            break;
+        }
+
+        if (type == MSG_FILE_DATA) {
+            file_meta_t fm;
+            uint32_t data_len;
+
+            if (rlen < FILE_META_SIZE) {
+                printf("[download] malformed DATA chunk\n");
+                break;
+            }
+            file_meta_unpack(resp, &fm);
+            total = fm.total_size;
+            data_len = rlen - FILE_META_SIZE;
+
+            if (fseek(fp, fm.offset, SEEK_SET) != 0 ||
+                fwrite(resp + FILE_META_SIZE, 1, data_len, fp) != data_len) {
+                printf("[download] write failed: %s\n", strerror(errno));
+                break;
+            }
+            received += data_len;
+
+            printf("\r[download] %u/%u bytes", received, total);
+            fflush(stdout);
+
+            if (fm.flags & FILE_FLAG_FINAL) {
+                ok = 1;
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+
+    if (ok) {
+        printf("\n[download] done: %s -> %s (%u bytes)\n",
+               remote_path, local_path, received);
+    } else {
+        printf("\n[download] failed, removing partial file '%s'\n", local_path);
+        unlink(local_path);
+    }
 }
 
 static void usage(const char *prog)
@@ -458,6 +712,46 @@ retry_selection:
                     printf("\n");
                 } else {
                     printf("\n(no clients connected)\n\n");
+                }
+                continue;
+            }
+
+            /* 文件上传: :push <local_file> <remote_path> */
+            if (strncmp(input, ":push", 5) == 0 &&
+                (input[5] == '\0' || input[5] == ' ')) {
+                char *saveptr = NULL;
+                char *local_path;
+                char *remote_path;
+
+                strtok_r(input, " \t", &saveptr);           /* 跳过 :push */
+                local_path = strtok_r(NULL, " \t", &saveptr);
+                remote_path = strtok_r(NULL, " \t", &saveptr);
+
+                if (local_path == NULL || remote_path == NULL) {
+                    printf("Usage: :push <local_file> <remote_path>\n");
+                } else {
+                    do_upload(fd, selected, req_id, local_path, remote_path);
+                    req_id++;
+                }
+                continue;
+            }
+
+            /* 文件下载: :pull <remote_path> <local_file> */
+            if (strncmp(input, ":pull", 5) == 0 &&
+                (input[5] == '\0' || input[5] == ' ')) {
+                char *saveptr = NULL;
+                char *remote_path;
+                char *local_path;
+
+                strtok_r(input, " \t", &saveptr);           /* 跳过 :pull */
+                remote_path = strtok_r(NULL, " \t", &saveptr);
+                local_path = strtok_r(NULL, " \t", &saveptr);
+
+                if (remote_path == NULL || local_path == NULL) {
+                    printf("Usage: :pull <remote_path> <local_file>\n");
+                } else {
+                    do_download(fd, selected, req_id, remote_path, local_path);
+                    req_id++;
                 }
                 continue;
             }

@@ -17,6 +17,10 @@ static int msg_type_valid(msg_type_t type)
     case MSG_LIST:
     case MSG_LIST_RESP:
     case MSG_CANCEL:
+    case MSG_FILE_UPLOAD:
+    case MSG_FILE_DOWNLOAD:
+    case MSG_FILE_DATA:
+    case MSG_FILE_ACK:
         return 1;
     default:
         return 0;
@@ -133,7 +137,49 @@ const char *msg_type_str(msg_type_t type)
         return "LIST_RESP";
     case MSG_CANCEL:
         return "CANCEL";
+    case MSG_FILE_UPLOAD:
+        return "FILE_UPLOAD";
+    case MSG_FILE_DOWNLOAD:
+        return "FILE_DOWNLOAD";
+    case MSG_FILE_DATA:
+        return "FILE_DATA";
+    case MSG_FILE_ACK:
+        return "FILE_ACK";
     default:
         return "UNKNOWN";
     }
+}
+
+void file_meta_pack(uint8_t *dst, const file_meta_t *m)
+{
+    uint32_t offset_net;
+    uint32_t total_net;
+
+    if (dst == NULL || m == NULL) {
+        return;
+    }
+
+    offset_net = htonl(m->offset);
+    total_net = htonl(m->total_size);
+
+    memcpy(dst + 0, &offset_net, 4);
+    memcpy(dst + 4, &total_net, 4);
+    dst[8] = m->flags;
+}
+
+void file_meta_unpack(const uint8_t *src, file_meta_t *m)
+{
+    uint32_t offset_net;
+    uint32_t total_net;
+
+    if (src == NULL || m == NULL) {
+        return;
+    }
+
+    memcpy(&offset_net, src + 0, 4);
+    memcpy(&total_net, src + 4, 4);
+
+    m->offset = ntohl(offset_net);
+    m->total_size = ntohl(total_net);
+    m->flags = src[8];
 }

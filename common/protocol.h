@@ -12,6 +12,11 @@
 #define MAX_CMD_LEN 4096
 #define MAX_RESULT_LEN 65536
 
+/* 文件传输相关 */
+#define FILE_CHUNK_SIZE (MAX_PAYLOAD - 1024)  /* 单块数据量，预留路径/头部空间 */
+#define FILE_META_SIZE  9                     /* offset(4) + total(4) + flags(1) */
+#define FILE_FLAG_FINAL 0x01                  /* flags 位0：最后一块 */
+
 typedef enum {
     MSG_REGISTER = 1,
     MSG_REGISTER_ACK = 2,
@@ -22,7 +27,11 @@ typedef enum {
     MSG_ERROR = 7,
     MSG_LIST = 8,
     MSG_LIST_RESP = 9,
-    MSG_CANCEL = 10
+    MSG_CANCEL = 10,
+    MSG_FILE_UPLOAD = 11,
+    MSG_FILE_DOWNLOAD = 12,
+    MSG_FILE_DATA = 13,
+    MSG_FILE_ACK = 14
 } msg_type_t;
 
 typedef struct {
@@ -33,6 +42,13 @@ typedef struct {
     uint32_t length;  /* payload length */
 } __attribute__((packed)) msg_header_t;
 
+/* 文件分块元信息（嵌入 payload，多字节字段按网络字节序） */
+typedef struct {
+    uint32_t offset;      /* 本块在文件中的偏移 */
+    uint32_t total_size;  /* 文件总大小 */
+    uint8_t  flags;       /* FILE_FLAG_FINAL 等 */
+} __attribute__((packed)) file_meta_t;
+
 /* 打包消息到 buf，返回总字节数（含 header）。失败返回 -1。 */
 int msg_pack(uint8_t *buf, size_t bufsize, msg_type_t type, uint32_t req_id,
              const void *payload, uint32_t length);
@@ -42,5 +58,11 @@ int msg_parse_header(const uint8_t *buf, size_t buflen, msg_header_t *hdr);
 
 /* 辅助函数：返回 type 对应的字符串名。 */
 const char *msg_type_str(msg_type_t type);
+
+/* 将文件分块元信息按网络字节序写入 dst（需 >= FILE_META_SIZE 字节）。 */
+void file_meta_pack(uint8_t *dst, const file_meta_t *m);
+
+/* 从 src 按网络字节序解析文件分块元信息（需 >= FILE_META_SIZE 字节）。 */
+void file_meta_unpack(const uint8_t *src, file_meta_t *m);
 
 #endif /* PROTOCOL_H */

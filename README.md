@@ -88,8 +88,8 @@ Select client (number, client_id, or :quit): 1
 [web-01:/home/user] $ uname -a
 [web-01:/home/user] $ cd /tmp
 [web-01:/tmp] $ ls -la
-[web-01:/tmp] $ df -h
-[web-01:/tmp] $ whoami
+[web-01:/tmp] $ :push ./report.tar.gz /tmp/report.tar.gz
+[web-01:/tmp] $ :pull /var/log/syslog ./syslog.log
 [web-01:/tmp] $ :quit
 ```
 
@@ -107,6 +107,8 @@ Shell 模式内置命令：
 | `:quit` / `:q` | 返回客户端列表 |
 | `:help` / `:h` | 显示帮助 |
 | `:list` / `:l` | 刷新并显示客户端列表 |
+| `:push <local> <remote>` | 上传本地文件到客户端（原 `:upload`） |
+| `:pull <remote> <local>` | 下载客户端文件到本地（原 `:download`） |
 | 其他输入   | 作为 shell 命令在所选客户端上执行 |
 
 ### 4. 添加更多客户端
@@ -314,4 +316,4 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 - [x] 客户端列表查询（`MSG_LIST` / `MSG_LIST_RESP`，管理端列表选择 + `:list` 命令）
 - [ ] 接入命令历史与方向键浏览（`admin/history.*`、`admin/term.*` 已实现，待接入 `admin.c` 并加入 Makefile）
 - [ ] 命令审计日志
-- [ ] 文件传输功能
+- [x] 文件传输功能（`:push` 上传 / `:pull` 下载，支持分块传输与进度显示）
