@@ -1,0 +1,14 @@
+[Unit]
+Description=Client Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/main/hx01-main
+ExecStart=/data/main/hx01-main/client/client -d -p /tmp/hx01-tl-eld-01.pid -l /tmp/hx01-tl-eld-01.log 101.37.23.5 8888 tl-eld-01
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

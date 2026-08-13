@@ -281,8 +281,8 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 │   ├── protocol.c     # 消息打包/解析
 │   ├── utils.h        # 网络辅助函数声明
 │   └── utils.c        # send_message/recv_message 等
-├── server/            # 服务端
-│   └── server.c       # select 事件循环，中转转发
+├── server/            # 服务端（仅 Linux，依赖 epoll）
+│   └── server.c       # epoll ET 事件循环，非阻塞读写，中转转发
 ├── client/            # 客户端（被控端）
 │   └── client.c       # 反向连接、注册、fork/exec 执行命令（CWD 追踪，支持取消）、心跳、重连
 └── admin/             # 管理端
@@ -309,7 +309,7 @@ DAEMON_LOG_DIR = /tmp      # 守护进程日志目录
 - ✅ **粘包处理**（帧头含 length，按长度读取）
 - ✅ **文件传输**（`:push` 上传 / `:pull` 下载，分块传输 + 进度显示）
 - ✅ **行编辑与历史**（↑/↓ 浏览历史命令，←/→ 移动光标，Backspace/Ctrl+A/E/K/U 行编辑）
-- ✅ 跨平台（select 模型，macOS/Linux 通用）
+- ✅ **epoll 高并发**（服务端边缘触发，单线程支撑数万连接；client/admin 跨平台 macOS/Linux 通用）
 
 ## 后续改进方向
 

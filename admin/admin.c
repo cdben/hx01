@@ -31,7 +31,7 @@
 #include "history.h"
 #include "term.h"
 
-#define MAX_CLIENT_LIST 256
+#define MAX_CLIENT_LIST 65536
 
 /* 连接到服务端，返回 fd 或 -1 */
 static int connect_server(const char *ip, int port)

@@ -37,8 +37,17 @@ DAEMON_LOG_DIR  = /tmp
 # 公共目标文件
 COMMON_OBJ = common/protocol.o common/utils.o
 
-# 默认目标: 编译全部三个端
-all: server/server client/client admin/admin
+# 平台检测：server 使用 epoll，仅在 Linux 上编译
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    TARGETS := server/server client/client admin/admin
+else
+    # macOS 等非 Linux 平台：server 依赖 epoll 无法本地编译，仅编 client/admin
+    TARGETS := client/client admin/admin
+endif
+
+# 默认目标
+all: $(TARGETS)
 
 # --- 公共层 ---
 common/protocol.o: common/protocol.c common/protocol.h
@@ -50,6 +59,11 @@ common/utils.o: common/utils.c common/utils.h
 # --- 服务端 ---
 server/server: server/server.c $(COMMON_OBJ)
 	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS)
+
+# 单端编译别名（方便在服务器上只编某一端，如 `make server`）
+server: server/server
+client: client/client
+admin: admin/admin
 
 # --- 客户端 ---
 client/client: client/client.c $(COMMON_OBJ)
@@ -123,7 +137,7 @@ clean:
 	rm -f $(COMMON_OBJ) server/server client/client admin/admin
 	rm -rf server/*.dSYM client/*.dSYM admin/*.dSYM
 
-.PHONY: all clean run-all \
+.PHONY: all clean run-all server client admin \
         run-server \
         run-client1 run-client2 run-client3 \
         run-client1d run-client2d run-client3d \
