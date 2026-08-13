@@ -156,41 +156,57 @@ tail -f /var/log/hx01.log
 
 #### Linux（systemd）
 
-创建 service 模板单元 `/etc/systemd/system/hx01-client@.service`：
+创建 service 模板单元 `/etc/systemd/system/client.service`：
 
 ```ini
+
 [Unit]
-Description=HX01 Remote Client (%i)
-After=network-online.target
-Wants=network-online.target
+Description=Client Service
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 
 [Service]
 Type=simple
-ExecStart=/opt/hx01/client -d -p /var/run/hx01-%i.pid -l /var/log/hx01-%i.log <server_ip> <server_port> %i
-ExecStop=/bin/kill $(cat /var/run/hx01-%i.pid)
+WorkingDirectory=/data/main/hx01-main
+ExecStart=/data/main/hx01-main/client/client 101.37.23.5 8888 tl-eld-01
 Restart=always
 RestartSec=10
+TimeoutStartSec=0
+
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+
 
 [Install]
 WantedBy=multi-user.target
+
+
 ```
 
-`%i` 是实例占位符，部署时是一条命令：
-
 ```bash
-# 部署可执行文件
-cp client /opt/hx01/client
 
-# 启用 web-01 实例（开机自启 + 立即启动）
-systemctl enable --now hx01-client@web-01.service
 
-# 多台机器
-systemctl enable --now hx01-client@db-01.service
-systemctl enable --now hx01-client@cache-01.service
+# 重新加载 systemd 配置
+sudo systemctl daemon-reload
+
+# 启用开机自启
+sudo systemctl enable client.service
+
+# 立即启动
+sudo systemctl start client.service
+
+# 查看状态
+sudo systemctl status client.service
+
 
 # 查看状态 / 日志
-systemctl status hx01-client@web-01.service
-journalctl -u hx01-client@web-01.service -f
+sudo journalctl -u client -f 
+
+
 ```
 
 #### macOS（launchd）
