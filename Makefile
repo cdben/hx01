@@ -21,6 +21,14 @@ CC        = gcc
 CFLAGS    = -Wall -Wextra -g -Icommon
 LDFLAGS   =
 
+# 平台检测：HMAC 在 Linux 用 OpenSSL（需 -lcrypto），macOS 用 CommonCrypto（无需链接）
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    CRYPTO_LIB := -lcrypto
+else
+    CRYPTO_LIB :=
+endif
+
 # ---- 服务端配置 ----
 SERVER_HOST = 172.16.115.144
 SERVER_PORT = 8888
@@ -35,19 +43,10 @@ DAEMON_PID_DIR  = /tmp
 DAEMON_LOG_DIR  = /tmp
 
 # 公共目标文件
-COMMON_OBJ = common/protocol.o common/utils.o
+COMMON_OBJ = common/protocol.o common/utils.o common/hmac.o
 
-# 平台检测：server 使用 epoll，仅在 Linux 上编译
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Linux)
-    TARGETS := server/server client/client admin/admin
-else
-    # macOS 等非 Linux 平台：server 依赖 epoll 无法本地编译，仅编 client/admin
-    TARGETS := client/client admin/admin
-endif
-
-# 默认目标
-all: $(TARGETS)
+# 默认目标：编译全部三个端（server 用 epoll/kqueue 条件编译，Linux/macOS 均可）
+all: server/server client/client admin/admin
 
 # --- 公共层 ---
 common/protocol.o: common/protocol.c common/protocol.h
@@ -56,9 +55,12 @@ common/protocol.o: common/protocol.c common/protocol.h
 common/utils.o: common/utils.c common/utils.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
+common/hmac.o: common/hmac.c common/hmac.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # --- 服务端 ---
 server/server: server/server.c $(COMMON_OBJ)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS) $(CRYPTO_LIB)
 
 # 单端编译别名（方便在服务器上只编某一端，如 `make server`）
 server: server/server
@@ -67,7 +69,7 @@ admin: admin/admin
 
 # --- 客户端 ---
 client/client: client/client.c $(COMMON_OBJ)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJ) -o $@ $(LDFLAGS) $(CRYPTO_LIB)
 
 # --- 管理端 ---
 ADMIN_OBJ = admin/history.o admin/term.o
@@ -79,7 +81,7 @@ admin/term.o: admin/term.c admin/term.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 admin/admin: admin/admin.c $(COMMON_OBJ) $(ADMIN_OBJ)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJ) $(ADMIN_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJ) $(ADMIN_OBJ) -o $@ $(LDFLAGS) $(CRYPTO_LIB)
 
 # ============================================================
 #  运行命令

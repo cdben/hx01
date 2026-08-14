@@ -1,18 +1,20 @@
 /*
- * server.c - 远程管理服务端（中转枢纽，单线程 epoll）
+ * server.c - 远程管理服务端（中转枢纽，单线程事件驱动）
  *
  * 职责：
  *   1. 监听端口，接受客户端（被控端）和管理端两类连接
  *   2. 客户端注册后维护 client_id <-> fd 映射
  *   3. 管理端发来的 CMD 转发给目标客户端
  *   4. 客户端返回的 RESULT 转发给所有管理端
- *   5. 心跳保活
+ *   5. 心跳保活 + 超时清理
  *
  * 用法: ./server [port]    默认端口 8888
  *
- * IO 模型：epoll 边缘触发（ET），非阻塞 socket。每条连接维护独立的
- * 读/写缓冲区以处理 TCP 拆包/粘包与发送积压。fd 仍用作 conns[] 下标，
- * 配合 epoll_data.ptr 直接定位连接结构，避免遍历扫描。
+ * IO 模型：事件驱动，边缘触发，非阻塞 socket。后端按平台选择：
+ *   Linux  → epoll
+ *   macOS  → kqueue
+ * 通过 io_* 抽象层隔离，上层逻辑与具体后端无关。每条连接维护独立的
+ * 读/写缓冲区以处理 TCP 拆包/粘包与发送积压。fd 仍用作 conns[] 下标。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,20 +27,166 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/epoll.h>
 
 #include "protocol.h"
 #include "utils.h"
+#include "hmac.h"
 
 #define DEFAULT_PORT 8888
 #define LISTEN_BACKLOG 4096        /* listen backlog，应对瞬时并发重连 */
-#define EPOLL_EVENTS   1024        /* 单次 epoll_wait 取出的事件数 */
-#define READ_CHUNK     16384       /* 单次 read 尝试读取量 */
-#define SWEEP_INTERVAL 10          /* 超时扫描间隔（秒），epoll_wait 超时 */
+#define IO_EVENTS      1024        /* 单次 io_wait 取出的事件数 */
+#define SWEEP_INTERVAL 10          /* 超时扫描间隔（秒），io_wait 超时 */
 #define CLIENT_TIMEOUT 45          /* 客户端无活动超时（秒），3 个心跳周期 */
+#define AUTH_TIMEOUT   15          /* 认证超时（秒），超时未认证则断开 */
 
 /* 单条消息最大字节数：header + payload */
 #define MAX_MSG_SIZE   (HEADER_SIZE + MAX_PAYLOAD)
+
+/* ============================================================
+ *  IO 抽象层：事件标志
+ * ============================================================ */
+#define IO_READ   0x1
+#define IO_WRITE  0x2
+#define IO_ERROR  0x4
+
+/* 事件返回结构：io_wait 填充，上层读取 */
+typedef struct {
+    void *ptr;       /* 关联的连接指针（listen socket 为 NULL） */
+    int   events;    /* IO_READ/IO_WRITE/IO_ERROR 的位或 */
+} io_event_t;
+
+/* ============================================================
+ *  平台后端实现
+ * ============================================================ */
+#if defined(__linux__)
+/* ---------- epoll 后端 ---------- */
+#include <sys/epoll.h>
+
+typedef int io_ctx_t;
+
+static int io_init(io_ctx_t *io)
+{
+    *io = epoll_create1(0);
+    return *io < 0 ? -1 : 0;
+}
+
+/* 注册/修改 fd 的事件监听。events=0 表示删除。ptr 关联用户数据。 */
+static int io_ctl(io_ctx_t io, int op, int fd, int events, void *ptr)
+{
+    struct epoll_event ev;
+    ev.data.ptr = ptr;
+    ev.events = 0;
+    if (events & IO_READ)  ev.events |= EPOLLIN;
+    if (events & IO_WRITE) ev.events |= EPOLLOUT;
+    ev.events |= EPOLLET;   /* 边缘触发 */
+    int epoll_op;
+    if (op == 1)      epoll_op = EPOLL_CTL_ADD;
+    else if (op == 2) epoll_op = EPOLL_CTL_MOD;
+    else              epoll_op = EPOLL_CTL_DEL;
+    return epoll_ctl(io, epoll_op, fd, &ev);
+}
+
+static int io_wait(io_ctx_t io, io_event_t *out, int maxout, int timeout_ms)
+{
+    struct epoll_event evs[IO_EVENTS];
+    int n = epoll_wait(io, evs,
+                       maxout < IO_EVENTS ? maxout : IO_EVENTS,
+                       timeout_ms);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        out[i].ptr = evs[i].data.ptr;
+        out[i].events = 0;
+        if (evs[i].events & (EPOLLERR | EPOLLHUP)) out[i].events |= IO_ERROR;
+        if (evs[i].events & EPOLLIN)  out[i].events |= IO_READ;
+        if (evs[i].events & EPOLLOUT) out[i].events |= IO_WRITE;
+    }
+    return n;
+}
+
+static void io_close(io_ctx_t io)
+{
+    close(io);
+}
+
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+/* ---------- kqueue 后端 ---------- */
+#include <sys/event.h>
+
+typedef int io_ctx_t;
+
+static int io_init(io_ctx_t *io)
+{
+    *io = kqueue();
+    return *io < 0 ? -1 : 0;
+}
+
+/* 注册/修改 fd 的事件监听。events=0 表示删除。ptr 关联用户数据。 */
+static int io_ctl(io_ctx_t io, int op, int fd, int events, void *ptr)
+{
+    struct kevent changes[2];
+    int nchanges = 0;
+    /* kqueue 用 EV_ADD/EV_DELETE，删除时两个 filter 都带 EV_DELETE */
+    unsigned short flag_add = EV_ADD | EV_CLEAR;  /* EV_CLEAR = 边缘触发 */
+    unsigned short flag = (op == 3) ? EV_DELETE : flag_add;
+
+    if ((events & IO_READ) || op == 3) {
+        EV_SET(&changes[nchanges], fd, EVFILT_READ, flag, 0, 0, ptr);
+        nchanges++;
+    }
+    if ((events & IO_WRITE) && op != 3) {
+        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, flag, 0, 0, ptr);
+        nchanges++;
+    }
+    if (nchanges == 0) return 0;
+    return kevent(io, changes, nchanges, NULL, 0, NULL) < 0 ? -1 : 0;
+}
+
+static int io_wait(io_ctx_t io, io_event_t *out, int maxout, int timeout_ms)
+{
+    struct kevent evs[IO_EVENTS];
+    struct timespec ts, *pts;
+    if (timeout_ms < 0) {
+        pts = NULL;
+    } else {
+        ts.tv_sec = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+        pts = &ts;
+    }
+    int n = kevent(io, NULL, 0, evs,
+                   maxout < IO_EVENTS ? maxout : IO_EVENTS, pts);
+    if (n < 0) return -1;
+    /* 同一 fd 的 READ/WRITE 可能分成两个事件，合并到同一 ptr */
+    int out_n = 0;
+    for (int i = 0; i < n; i++) {
+        /* 找已有的同 ptr 事件合并 */
+        int found = -1;
+        for (int j = 0; j < out_n; j++) {
+            if (out[j].ptr == evs[i].udata) { found = j; break; }
+        }
+        if (found < 0) {
+            found = out_n++;
+            out[found].ptr = evs[i].udata;
+            out[found].events = 0;
+        }
+        if (evs[i].flags & EV_ERROR) out[found].events |= IO_ERROR;
+        if (evs[i].filter == EVFILT_READ)  out[found].events |= IO_READ;
+        if (evs[i].filter == EVFILT_WRITE) out[found].events |= IO_WRITE;
+    }
+    return out_n;
+}
+
+static void io_close(io_ctx_t io)
+{
+    close(io);
+}
+
+#else
+#error "unsupported platform: need epoll (Linux) or kqueue (macOS/BSD)"
+#endif
+
+/* ============================================================
+ *  连接管理（与 IO 后端无关）
+ * ============================================================ */
 
 /* 连接类型 */
 typedef enum {
@@ -63,16 +211,26 @@ typedef struct {
     int          registered;
     time_t       last_active;   /* 最后一次收到数据的时间，用于心跳超时 */
 
+    /* 身份认证状态 */
+    int          authenticated;        /* 0=未认证, 1=已认证 */
+    time_t       connect_time;         /* 连接建立时间，用于认证超时 */
+    uint8_t      challenge[CHALLENGE_LEN]; /* 下发给该连接的挑战随机数 */
+    int          challenge_issued;     /* 是否已下发挑战 */
+
     /* 读缓冲：拼接未读完的半包 */
     uint8_t     *rbuf;          /* 读缓冲，容量 MAX_MSG_SIZE */
     size_t       rlen;          /* 当前已读入字节数 */
 
-    /* 写缓冲队列：非阻塞写时若 EAGAIN 则入队，等 EPOLLOUT 再发 */
+    /* 写缓冲队列：非阻塞写时若 EAGAIN 则入队，等可写事件再发 */
     write_buf_t *whead;
     write_buf_t *wtail;
 } conn_info_t;
 
 static conn_info_t conns[MAX_CLIENTS];
+
+/* 共享密钥（认证用）。为 NULL 时不强制认证（兼容旧行为）。 */
+static const char *g_secret = NULL;
+static size_t      g_secret_len = 0;
 
 /* admin 链表：广播 RESULT/FILE_DATA 时遍历，避免扫全表 */
 static int admin_fds[MAX_CLIENTS];
@@ -88,6 +246,9 @@ static void init_conns(void)
         conns[i].client_id[0] = '\0';
         conns[i].registered = 0;
         conns[i].last_active = 0;
+        conns[i].authenticated = 0;
+        conns[i].connect_time = 0;
+        conns[i].challenge_issued = 0;
         conns[i].rbuf = NULL;
         conns[i].rlen = 0;
         conns[i].whead = NULL;
@@ -151,8 +312,8 @@ static void write_queue_free(conn_info_t *c)
     c->wtail = NULL;
 }
 
-/* 关闭连接并清理：close、清零 conns[fd]、从 epoll 摘除 */
-static void close_conn(int fd, int epfd)
+/* 关闭连接并清理：close、清零 conns[fd]、从事件表摘除 */
+static void close_conn(int fd, io_ctx_t io)
 {
     if (fd < 0 || fd >= MAX_CLIENTS) {
         return;
@@ -167,7 +328,7 @@ static void close_conn(int fd, int epfd)
         admin_unregister(fd);
     }
 
-    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    io_ctl(io, 3, fd, 0, NULL);  /* DEL */
     close(fd);
 
     free(c->rbuf);
@@ -178,12 +339,15 @@ static void close_conn(int fd, int epfd)
     c->client_id[0] = '\0';
     c->registered = 0;
     c->last_active = 0;
+    c->authenticated = 0;
+    c->connect_time = 0;
+    c->challenge_issued = 0;
     c->rbuf = NULL;
     c->rlen = 0;
 }
 
-/* 处理新连接：accept、设非阻塞、加入 epoll(ET)、初始化 conns[fd] */
-static void handle_new_connection(int listen_fd, int epfd)
+/* 处理新连接：accept、设非阻塞、加入事件表(ET)、初始化 conns[fd] */
+static void handle_new_connection(int listen_fd, io_ctx_t io)
 {
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
@@ -219,6 +383,9 @@ static void handle_new_connection(int listen_fd, int epfd)
         c->type = CONN_TYPE_UNKNOWN;
         c->registered = 0;
         c->last_active = time(NULL);
+        c->connect_time = c->last_active;
+        c->authenticated = 0;
+        c->challenge_issued = 0;
         c->client_id[0] = '\0';
         c->rbuf = malloc(MAX_MSG_SIZE);
         if (c->rbuf == NULL) {
@@ -231,12 +398,9 @@ static void handle_new_connection(int listen_fd, int epfd)
         c->whead = NULL;
         c->wtail = NULL;
 
-        /* 加入 epoll：边缘触发，监听可读 */
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.ptr = c;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            perror("[server] epoll_ctl add");
+        /* 加入事件表：边缘触发，监听可读 */
+        if (io_ctl(io, 1, fd, IO_READ, c) < 0) {
+            perror("[server] io_ctl add");
             free(c->rbuf);
             close(fd);
             c->fd = -1;
@@ -252,11 +416,11 @@ static void handle_new_connection(int listen_fd, int epfd)
 /*
  * 尝试把一条完整消息写入连接。非阻塞写：
  *   - 能直接写完则立即写并返回
- *   - 写不完或 EAGAIN 则把剩余部分挂到写缓冲队列，由 EPOLLOUT 驱动
+ *   - 写不完或 EAGAIN 则把剩余部分挂到写缓冲队列，由可写事件驱动
  * 返回 0 成功（已发送或已入队），-1 连接已断开。
  */
 static int conn_send(int fd, msg_type_t type, uint32_t req_id,
-                     const void *payload, uint32_t length, int epfd)
+                     const void *payload, uint32_t length, io_ctx_t io)
 {
     conn_info_t *c = &conns[fd];
 
@@ -296,13 +460,10 @@ static int conn_send(int fd, msg_type_t type, uint32_t req_id,
     wb->sent = (size_t)n;
 
     if (wb->sent < wb->total) {
-        /* 没写完，入队并开启 EPOLLOUT */
+        /* 没写完，入队并开启可写监听 */
         c->whead = wb;
         c->wtail = wb;
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-        ev.data.ptr = c;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        io_ctl(io, 2, fd, IO_READ | IO_WRITE, c);
     } else {
         /* 一次写完，无需入队 */
         free(wb);
@@ -310,8 +471,8 @@ static int conn_send(int fd, msg_type_t type, uint32_t req_id,
     return 0;
 }
 
-/* 刷写缓冲队列。EPOLLOUT 触发时调用。返回 0 正常，-1 连接断开。 */
-static int flush_write_queue(int fd, int epfd)
+/* 刷写缓冲队列。可写事件触发时调用。返回 0 正常，-1 连接断开。 */
+static int flush_write_queue(int fd, io_ctx_t io)
 {
     conn_info_t *c = &conns[fd];
     write_buf_t *wb = c->whead;
@@ -324,7 +485,7 @@ static int flush_write_queue(int fd, int epfd)
                     continue;
                 }
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    return 0;  /* 写缓冲满，等下次 EPOLLOUT */
+                    return 0;  /* 写缓冲满，等下次可写事件 */
                 }
                 return -1;  /* 出错 */
             }
@@ -337,24 +498,21 @@ static int flush_write_queue(int fd, int epfd)
     }
     c->wtail = NULL;
 
-    /* 队列空了，关掉 EPOLLOUT，只留 EPOLLIN */
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = c;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    /* 队列空了，关掉可写监听，只留可读 */
+    io_ctl(io, 2, fd, IO_READ, c);
     return 0;
 }
 
 /* 广播一条消息给所有 admin */
 static void broadcast_to_admins(msg_type_t type, uint32_t req_id,
-                                const uint8_t *payload, uint32_t payload_len, int epfd)
+                                const uint8_t *payload, uint32_t payload_len, io_ctx_t io)
 {
     int i;
     for (i = 0; i < admin_count; i++) {
         int afd = admin_fds[i];
         if (conns[afd].fd >= 0) {
-            if (conn_send(afd, type, req_id, payload, payload_len, epfd) < 0) {
-                close_conn(afd, epfd);
+            if (conn_send(afd, type, req_id, payload, payload_len, io) < 0) {
+                close_conn(afd, io);
             }
         }
     }
@@ -362,7 +520,7 @@ static void broadcast_to_admins(msg_type_t type, uint32_t req_id,
 
 /* 将文件传输消息（UPLOAD/DOWNLOAD）按 payload 首段 client_id 路由转发到目标客户端；
  * 目标不存在时向管理端回 MSG_ERROR。 */
-static void forward_file_to_client(int fd, int epfd, msg_type_t type, uint32_t req_id,
+static void forward_file_to_client(int fd, io_ctx_t io, msg_type_t type, uint32_t req_id,
                                    const uint8_t *payload, uint32_t payload_len)
 {
     const char *target_id;
@@ -379,23 +537,93 @@ static void forward_file_to_client(int fd, int epfd, msg_type_t type, uint32_t r
         char errmsg[MAX_CLIENT_ID + 32];
         int elen = snprintf(errmsg, sizeof(errmsg),
                             "client '%s' not found", target_id);
-        conn_send(fd, MSG_ERROR, req_id, errmsg, (uint32_t)elen + 1, epfd);
+        conn_send(fd, MSG_ERROR, req_id, errmsg, (uint32_t)elen + 1, io);
         printf("[server] file transfer: client %s NOT FOUND\n", target_id);
         return;
     }
 
-    if (conn_send(target_fd, type, req_id, payload, payload_len, epfd) < 0) {
+    if (conn_send(target_fd, type, req_id, payload, payload_len, io) < 0) {
         fprintf(stderr, "[server] forward file msg failed fd=%d\n", target_fd);
     }
     printf("[server] admin -> client %s file transfer (%s)\n",
            target_id, msg_type_str(type));
 }
 
+/* 处理认证握手消息。返回 1 表示已处理（调用方不再继续），0 表示非认证消息。 */
+static int handle_auth_message(int fd, io_ctx_t io, msg_type_t type,
+                               const uint8_t *payload, uint32_t payload_len)
+{
+    conn_info_t *c = &conns[fd];
+
+    if (type == MSG_AUTH_INIT) {
+        /* client/admin 发起认证。生成挑战并下发。 */
+        if (c->challenge_issued) {
+            return 1;  /* 已下发过，忽略重复请求 */
+        }
+        if (random_bytes(c->challenge, CHALLENGE_LEN) != 0) {
+            fprintf(stderr, "[server] random_bytes failed fd=%d\n", fd);
+            close_conn(fd, io);
+            return 1;
+        }
+        c->challenge_issued = 1;
+        if (conn_send(fd, MSG_AUTH_CHALLENGE, 0, c->challenge, CHALLENGE_LEN, io) < 0) {
+            close_conn(fd, io);
+        }
+        return 1;
+    }
+
+    if (type == MSG_AUTH_RESPONSE) {
+        if (!c->challenge_issued || payload_len != HMAC_SHA256_LEN) {
+            close_conn(fd, io);
+            return 1;
+        }
+        /* 校验：HMAC(secret, challenge) == 收到的 response */
+        uint8_t expected[HMAC_SHA256_LEN];
+        hmac_sha256(g_secret, g_secret_len, c->challenge, CHALLENGE_LEN, expected);
+        if (memcmp(expected, payload, HMAC_SHA256_LEN) == 0) {
+            c->authenticated = 1;
+            printf("[server] fd=%d authenticated\n", fd);
+            conn_send(fd, MSG_AUTH_OK, 0, NULL, 0, io);
+        } else {
+            printf("[server] fd=%d auth failed (bad response)\n", fd);
+            conn_send(fd, MSG_AUTH_FAIL, 0, NULL, 0, io);
+            close_conn(fd, io);
+        }
+        return 1;
+    }
+
+    return 0;  /* 非认证消息 */
+}
+
 /* 处理一条完整消息（header+payload 已在 rbuf 中）。按消息类型分发。 */
-static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
+static void handle_message(int fd, io_ctx_t io, msg_type_t type, uint32_t req_id,
                            uint8_t *payload, uint32_t payload_len)
 {
     conn_info_t *c = &conns[fd];
+
+    /* 认证握手消息：任何阶段都由认证流程处理 */
+    if (type == MSG_AUTH_INIT || type == MSG_AUTH_RESPONSE) {
+        handle_auth_message(fd, io, type, payload, payload_len);
+        return;
+    }
+
+    /* 启用认证时，admin 控制类命令必须已认证。
+     * client 的消息（REGISTER/HEARTBEAT/RESULT/FILE_DATA/FILE_ACK）不需要认证。 */
+    if (g_secret != NULL && !c->authenticated) {
+        switch (type) {
+        case MSG_CMD:
+        case MSG_LIST:
+        case MSG_CANCEL:
+        case MSG_FILE_UPLOAD:
+        case MSG_FILE_DOWNLOAD:
+            fprintf(stderr, "[server] fd=%d not authenticated, rejecting %s\n",
+                    fd, msg_type_str(type));
+            close_conn(fd, io);
+            return;
+        default:
+            break;  /* client 类消息，放行 */
+        }
+    }
 
     switch (type) {
     case MSG_REGISTER: {
@@ -404,7 +632,7 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
         if (id_len <= 0 || id_len >= MAX_CLIENT_ID) {
             fprintf(stderr, "[server] invalid register payload len=%d from fd=%d\n",
                     id_len, fd);
-            close_conn(fd, epfd);
+            close_conn(fd, io);
             return;
         }
         memcpy(c->client_id, payload, id_len);
@@ -413,8 +641,8 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
         c->registered = 1;
 
         /* 回送 REGISTER_ACK */
-        if (conn_send(fd, MSG_REGISTER_ACK, 0, NULL, 0, epfd) < 0) {
-            close_conn(fd, epfd);
+        if (conn_send(fd, MSG_REGISTER_ACK, 0, NULL, 0, io) < 0) {
+            close_conn(fd, io);
             return;
         }
 
@@ -447,13 +675,13 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
             char errmsg[MAX_CLIENT_ID + 32];
             int elen = snprintf(errmsg, sizeof(errmsg),
                                 "client '%s' not found", target_id);
-            conn_send(fd, MSG_ERROR, req_id, errmsg, (uint32_t)elen + 1, epfd);
+            conn_send(fd, MSG_ERROR, req_id, errmsg, (uint32_t)elen + 1, io);
             printf("[server] admin -> client %s NOT FOUND\n", target_id);
             return;
         }
 
         /* 转发 CMD 给目标客户端（保持原始 req_id 和原始 payload） */
-        if (conn_send(target_fd, MSG_CMD, req_id, payload, payload_len, epfd) < 0) {
+        if (conn_send(target_fd, MSG_CMD, req_id, payload, payload_len, io) < 0) {
             fprintf(stderr, "[server] forward CMD failed fd=%d\n", target_fd);
         }
         printf("[server] admin -> client %s cmd: %s\n", target_id, cmd_str);
@@ -464,7 +692,7 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
         /* 客户端返回执行结果：转发给所有管理端 */
         const char *cid = c->registered ? c->client_id : "unknown";
         printf("[server] client %s -> admin result (req_id=%u)\n", cid, req_id);
-        broadcast_to_admins(MSG_RESULT, req_id, payload, payload_len, epfd);
+        broadcast_to_admins(MSG_RESULT, req_id, payload, payload_len, io);
         break;
     }
 
@@ -498,8 +726,8 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
         }
 
         if (conn_send(fd, MSG_LIST_RESP, 0, list_buf,
-                      (uint32_t)pos + 1, epfd) < 0) {
-            close_conn(fd, epfd);
+                      (uint32_t)pos + 1, io) < 0) {
+            close_conn(fd, io);
         }
         break;
     }
@@ -519,7 +747,7 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
             return;
         }
 
-        if (conn_send(target_fd, MSG_CANCEL, req_id, NULL, 0, epfd) < 0) {
+        if (conn_send(target_fd, MSG_CANCEL, req_id, NULL, 0, io) < 0) {
             fprintf(stderr, "[server] forward CANCEL failed fd=%d\n", target_fd);
         }
         printf("[server] CANCEL forwarded to client %s\n", target_id);
@@ -533,7 +761,7 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
             c->type = CONN_TYPE_ADMIN;
             admin_register(fd);
         }
-        forward_file_to_client(fd, epfd, type, req_id, payload, payload_len);
+        forward_file_to_client(fd, io, type, req_id, payload, payload_len);
         break;
 
     case MSG_FILE_DATA:
@@ -542,14 +770,14 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
         const char *cid = c->registered ? c->client_id : "unknown";
         printf("[server] client %s -> admin %s (req_id=%u)\n",
                cid, msg_type_str(type), req_id);
-        broadcast_to_admins(type, req_id, payload, payload_len, epfd);
+        broadcast_to_admins(type, req_id, payload, payload_len, io);
         break;
     }
 
     case MSG_HEARTBEAT:
         /* 心跳，回 ACK */
-        if (conn_send(fd, MSG_HEARTBEAT_ACK, 0, NULL, 0, epfd) < 0) {
-            close_conn(fd, epfd);
+        if (conn_send(fd, MSG_HEARTBEAT_ACK, 0, NULL, 0, io) < 0) {
+            close_conn(fd, io);
         }
         break;
 
@@ -564,7 +792,7 @@ static void handle_message(int fd, int epfd, msg_type_t type, uint32_t req_id,
  * 处理已有连接的可读事件：边缘触发，循环 read 直到 EAGAIN。
  * 读到的字节拼到 rbuf，每凑够一条完整消息就分发。
  */
-static void handle_client_data(int fd, int epfd)
+static void handle_client_data(int fd, io_ctx_t io)
 {
     conn_info_t *c = &conns[fd];
 
@@ -583,12 +811,12 @@ static void handle_client_data(int fd, int epfd)
                 break;  /* 读完了，等下次事件 */
             }
             /* 出错，关闭 */
-            close_conn(fd, epfd);
+            close_conn(fd, io);
             return;
         }
         if (n == 0) {
             /* 对端关闭 */
-            close_conn(fd, epfd);
+            close_conn(fd, io);
             return;
         }
         c->last_active = time(NULL);  /* 收到数据，刷新活跃时间 */
@@ -602,7 +830,7 @@ static void handle_client_data(int fd, int epfd)
             msg_header_t hdr;
             if (msg_parse_header(c->rbuf, HEADER_SIZE, &hdr) != 0) {
                 /* header 非法，丢弃连接 */
-                close_conn(fd, epfd);
+                close_conn(fd, io);
                 return;
             }
             size_t msg_size = HEADER_SIZE + hdr.length;
@@ -611,7 +839,7 @@ static void handle_client_data(int fd, int epfd)
             }
             /* 一条完整消息就绪 */
             uint8_t *payload = c->rbuf + HEADER_SIZE;
-            handle_message(fd, epfd, (msg_type_t)hdr.type, hdr.req_id,
+            handle_message(fd, io, (msg_type_t)hdr.type, hdr.req_id,
                            payload, hdr.length);
 
             /* 若连接已被 handle_message 关闭，直接返回 */
@@ -629,20 +857,33 @@ static void handle_client_data(int fd, int epfd)
     }
 }
 
-/* 扫描所有连接，清理超过 CLIENT_TIMEOUT 秒无活动的 client。
- * admin 不做超时清理（管理端可能长时间只等结果不发包）。 */
-static void sweep_timeout(int epfd)
+/* 扫描所有连接：
+ *   - client 超过 CLIENT_TIMEOUT 秒无活动 → 清理
+ *   - 启用认证时，连上后 AUTH_TIMEOUT 秒未认证 → 清理
+ * admin（已认证）不做超时清理（可能长时间只等结果不发包）。 */
+static void sweep_timeout(io_ctx_t io)
 {
     time_t now = time(NULL);
     int i;
     for (i = 0; i < MAX_CLIENTS; i++) {
-        if (conns[i].fd >= 0 && conns[i].type == CONN_TYPE_CLIENT &&
-            conns[i].registered) {
+        if (conns[i].fd < 0) {
+            continue;
+        }
+        /* 未认证连接超时清理 */
+        if (g_secret != NULL && !conns[i].authenticated) {
+            if (now - conns[i].connect_time > AUTH_TIMEOUT) {
+                printf("[server] fd=%d auth timeout, closing\n", i);
+                close_conn(i, io);
+            }
+            continue;
+        }
+        /* 已认证 client 心跳超时清理 */
+        if (conns[i].type == CONN_TYPE_CLIENT && conns[i].registered) {
             if (now - conns[i].last_active > CLIENT_TIMEOUT) {
                 printf("[server] client %s timeout (no activity %lds), closing\n",
                        conns[i].client_id,
                        (long)(now - conns[i].last_active));
-                close_conn(i, epfd);
+                close_conn(i, io);
             }
         }
     }
@@ -651,13 +892,26 @@ static void sweep_timeout(int epfd)
 int main(int argc, char *argv[])
 {
     int port = DEFAULT_PORT;
-    int listen_fd, epfd, nfds, i;
+    int listen_fd, nfds, i;
+    io_ctx_t io;
     struct sockaddr_in addr;
     int opt = 1;
-    if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+
+    /* 解析参数：<port> [--secret <密钥>]
+     * 带 --secret 时启用 HMAC 挑战认证，client/admin 须用相同密钥。 */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--secret") == 0 && i + 1 < argc) {
+            g_secret = argv[i + 1];
+            g_secret_len = strlen(g_secret);
+            i++;
+        } else if (argv[i][0] != '-') {
+            port = atoi(argv[i]);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Usage: %s <port> [--secret <secret>]\n", argv[0]);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "Usage: %s <port> [--secret <secret>]\n", argv[0]);
             return 1;
         }
     }
@@ -699,81 +953,83 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* 创建 epoll 实例 */
-    epfd = epoll_create1(0);
-    if (epfd < 0) {
-        perror("[server] epoll_create1");
+    /* 创建事件实例 */
+    if (io_init(&io) < 0) {
+        perror("[server] io_init");
         close(listen_fd);
         return 1;
     }
 
-    /* 监听 socket 加入 epoll，边缘触发 */
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = NULL;  /* listen socket 用 NULL 标记 */
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
-        perror("[server] epoll_ctl listen");
-        close(epfd);
+    /* 监听 socket 加入事件表，边缘触发 */
+    if (io_ctl(io, 1, listen_fd, IO_READ, NULL) < 0) {
+        perror("[server] io_ctl listen");
+        io_close(io);
         close(listen_fd);
         return 1;
     }
 
-    printf("[server] listening on port %d (epoll ET, single-thread)\n", port);
+#if defined(__linux__)
+    printf("[server] listening on port %d (epoll ET, single-thread, auth=%s)\n",
+           port, g_secret ? "on" : "off");
+#else
+    printf("[server] listening on port %d (kqueue ET, single-thread, auth=%s)\n",
+           port, g_secret ? "on" : "off");
+#endif
 
-    struct epoll_event events[EPOLL_EVENTS];
+    io_event_t events[IO_EVENTS];
 
-    /* 事件循环：epoll_wait 带 SWEEP_INTERVAL 秒超时，用于定期清理失联 client */
+    /* 事件循环：io_wait 带 SWEEP_INTERVAL 秒超时，用于定期清理失联 client */
     for (;;) {
-        nfds = epoll_wait(epfd, events, EPOLL_EVENTS, SWEEP_INTERVAL * 1000);
+        nfds = io_wait(io, events, IO_EVENTS, SWEEP_INTERVAL * 1000);
         if (nfds < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("[server] epoll_wait");
+            perror("[server] io_wait");
             break;
         }
 
         if (nfds == 0) {
-            /* epoll_wait 超时：扫描清理失联 client */
-            sweep_timeout(epfd);
+            /* io_wait 超时：扫描清理失联 client */
+            sweep_timeout(io);
             continue;
         }
 
         for (i = 0; i < nfds; i++) {
-            if (events[i].data.ptr == NULL) {
+            if (events[i].ptr == NULL) {
                 /* listen socket 可读：新连接 */
-                handle_new_connection(listen_fd, epfd);
+                handle_new_connection(listen_fd, io);
                 continue;
             }
 
-            conn_info_t *c = (conn_info_t *)events[i].data.ptr;
+            conn_info_t *c = (conn_info_t *)events[i].ptr;
             int fd = c->fd;
             if (fd < 0) {
                 continue;
             }
 
-            if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                close_conn(fd, epfd);
+            if (events[i].events & IO_ERROR) {
+                close_conn(fd, io);
                 continue;
             }
 
-            if (events[i].events & EPOLLIN) {
-                handle_client_data(fd, epfd);
+            if (events[i].events & IO_READ) {
+                handle_client_data(fd, io);
                 /* handle_client_data 可能关闭连接，需复查 */
                 if (conns[fd].fd < 0) {
                     continue;
                 }
             }
 
-            if (events[i].events & EPOLLOUT) {
-                if (flush_write_queue(fd, epfd) < 0) {
-                    close_conn(fd, epfd);
+            if (events[i].events & IO_WRITE) {
+                if (flush_write_queue(fd, io) < 0) {
+                    close_conn(fd, io);
                 }
             }
         }
     }
 
-    close(epfd);
+    io_close(io);
     close(listen_fd);
     return 0;
 }

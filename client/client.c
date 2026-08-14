@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -327,29 +328,46 @@ static void send_file_ack(int sock_fd, uint32_t req_id, int status,
 }
 
 /* 连接到服务端，返回 fd 或 -1 */
-static int connect_server(const char *ip, int port)
+static int connect_server(const char *host, int port)
 {
-    int fd;
-    struct sockaddr_in addr;
+    int fd = -1;
+    struct addrinfo hints, *res, *rp;
+    char port_str[16];
+    int gai_rc;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        /* IPv4 */
+    hints.ai_socktype = SOCK_STREAM;
+
+    gai_rc = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_rc != 0) {
+        /* getaddrinfo 失败不设 errno，用 gai_strerror 打印真实原因 */
+        fprintf(stderr, "[client] resolve '%s' failed: %s\n",
+                host, gai_strerror(gai_rc));
         return -1;
     }
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;  /* 连接成功 */
+        }
+        /* 连接失败，errno 此时是真实的（如 connection refused / timeout） */
         close(fd);
-        return -1;
+        fd = -1;
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
+    freeaddrinfo(res);
 
+    if (fd < 0 && errno == 0) {
+        /* 所有候选地址都 socket 失败但没设 errno 的兜底 */
+        errno = ECONNREFUSED;
+    }
     return fd;
 }
 

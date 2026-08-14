@@ -25,39 +25,97 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #include "protocol.h"
 #include "utils.h"
+#include "hmac.h"
 #include "history.h"
 #include "term.h"
 
 #define MAX_CLIENT_LIST 65536
 
-/* 连接到服务端，返回 fd 或 -1 */
-static int connect_server(const char *ip, int port)
+/* 连接到服务端（支持域名或 IP），返回 fd 或 -1 */
+static int connect_server(const char *host, int port)
 {
-    int fd;
-    struct sockaddr_in addr;
+    int fd = -1;
+    struct addrinfo hints, *res, *rp;
+    char port_str[16];
+    int gai_rc;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        /* IPv4 */
+    hints.ai_socktype = SOCK_STREAM;
+
+    gai_rc = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_rc != 0) {
+        fprintf(stderr, "[admin] resolve '%s' failed: %s\n",
+                host, gai_strerror(gai_rc));
         return -1;
     }
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;  /* 连接成功 */
+        }
         close(fd);
-        return -1;
+        fd = -1;
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
+    freeaddrinfo(res);
 
+    if (fd < 0 && errno == 0) {
+        errno = ECONNREFUSED;
+    }
     return fd;
+}
+
+/*
+ * 与 server 做 HMAC 挑战认证（同步、阻塞）。
+ * secret 为 NULL 时跳过。返回 0 成功，-1 失败。
+ */
+static int authenticate(int fd, const char *secret)
+{
+    if (secret == NULL) {
+        return 0;
+    }
+
+    if (send_message(fd, MSG_AUTH_INIT, 0, NULL, 0) < 0) {
+        return -1;
+    }
+
+    uint8_t buf[HEADER_SIZE + MAX_PAYLOAD];
+    msg_type_t type;
+    uint32_t req_id;
+    uint32_t payload_len;
+    if (recv_message(fd, buf, sizeof(buf), &type, &req_id, NULL, &payload_len) < 0) {
+        return -1;
+    }
+    if (type != MSG_AUTH_CHALLENGE || payload_len != CHALLENGE_LEN) {
+        fprintf(stderr, "[admin] unexpected auth response: %s\n", msg_type_str(type));
+        return -1;
+    }
+
+    uint8_t response[HMAC_SHA256_LEN];
+    hmac_sha256(secret, strlen(secret), buf + HEADER_SIZE, CHALLENGE_LEN, response);
+    if (send_message(fd, MSG_AUTH_RESPONSE, 0, response, HMAC_SHA256_LEN) < 0) {
+        return -1;
+    }
+
+    if (recv_message(fd, buf, sizeof(buf), &type, &req_id, NULL, &payload_len) < 0) {
+        return -1;
+    }
+    if (type != MSG_AUTH_OK) {
+        fprintf(stderr, "[admin] authentication failed: %s\n", msg_type_str(type));
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -698,27 +756,39 @@ static void do_download(int fd, const char *client_id, uint32_t req_id,
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", prog);
+    fprintf(stderr, "Usage: %s [-s secret] <server_ip> <server_port>\n", prog);
     fprintf(stderr, "Example: %s 127.0.0.1 8888\n", prog);
+    fprintf(stderr, "         %s -s mysecret 127.0.0.1 8888\n", prog);
 }
 
 int main(int argc, char *argv[])
 {
     const char *server_ip;
     int server_port;
+    const char *secret = NULL;
     int fd;
     uint32_t req_id = 1;
     char cwd[PATH_MAX];
 
-    if (argc != 3) {
+    /* 解析可选 -s secret，剩余两个位置参数 */
+    int pos_start = 1;
+    if (argc >= 2 && strcmp(argv[1], "-s") == 0) {
+        if (argc < 5) {
+            usage(argv[0]);
+            return 1;
+        }
+        secret = argv[2];
+        pos_start = 3;
+    }
+    if (argc - pos_start != 2) {
         usage(argv[0]);
         return 1;
     }
 
-    server_ip = argv[1];
-    server_port = atoi(argv[2]);
+    server_ip = argv[pos_start];
+    server_port = atoi(argv[pos_start + 1]);
     if (server_port <= 0 || server_port > 65535) {
-        fprintf(stderr, "Invalid port: %s\n", argv[2]);
+        fprintf(stderr, "Invalid port: %s\n", argv[pos_start + 1]);
         return 1;
     }
 
@@ -733,6 +803,16 @@ int main(int argc, char *argv[])
     }
 
     printf("[admin] connected to server\n");
+
+    /* 认证（若配置了密钥） */
+    if (secret != NULL) {
+        if (authenticate(fd, secret) < 0) {
+            fprintf(stderr, "[admin] auth failed\n");
+            close(fd);
+            return 1;
+        }
+        printf("[admin] authenticated\n");
+    }
 
     history_t hist;
     hist_init(&hist);

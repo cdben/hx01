@@ -21,6 +21,11 @@ static int msg_type_valid(msg_type_t type)
     case MSG_FILE_DOWNLOAD:
     case MSG_FILE_DATA:
     case MSG_FILE_ACK:
+    case MSG_AUTH_INIT:
+    case MSG_AUTH_CHALLENGE:
+    case MSG_AUTH_RESPONSE:
+    case MSG_AUTH_OK:
+    case MSG_AUTH_FAIL:
         return 1;
     default:
         return 0;
@@ -145,6 +150,16 @@ const char *msg_type_str(msg_type_t type)
         return "FILE_DATA";
     case MSG_FILE_ACK:
         return "FILE_ACK";
+    case MSG_AUTH_INIT:
+        return "AUTH_INIT";
+    case MSG_AUTH_CHALLENGE:
+        return "AUTH_CHALLENGE";
+    case MSG_AUTH_RESPONSE:
+        return "AUTH_RESPONSE";
+    case MSG_AUTH_OK:
+        return "AUTH_OK";
+    case MSG_AUTH_FAIL:
+        return "AUTH_FAIL";
     default:
         return "UNKNOWN";
     }

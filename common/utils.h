@@ -25,4 +25,7 @@ int send_message(int fd, msg_type_t type, uint32_t req_id,
 /* 设置 fd 为非阻塞，返回 0 成功，-1 失败。 */
 int set_nonblock(int fd);
 
+/* 从 /dev/urandom 读取 len 字节随机数到 buf，返回 0 成功，-1 失败。 */
+int random_bytes(void *buf, size_t len);
+
 #endif /* UTILS_H */

@@ -17,6 +17,9 @@
 #define FILE_META_SIZE  9                     /* offset(4) + total(4) + flags(1) */
 #define FILE_FLAG_FINAL 0x01                  /* flags 位0：最后一块 */
 
+/* 身份认证（HMAC 挑战应答） */
+#define CHALLENGE_LEN  32                     /* 认证挑战随机数长度（字节） */
+
 typedef enum {
     MSG_REGISTER = 1,
     MSG_REGISTER_ACK = 2,
@@ -31,7 +34,13 @@ typedef enum {
     MSG_FILE_UPLOAD = 11,
     MSG_FILE_DOWNLOAD = 12,
     MSG_FILE_DATA = 13,
-    MSG_FILE_ACK = 14
+    MSG_FILE_ACK = 14,
+    /* 身份认证（HMAC 挑战应答） */
+    MSG_AUTH_INIT = 15,     /* client/admin → server：发起认证（payload: 角色+可选id） */
+    MSG_AUTH_CHALLENGE = 16,/* server → client/admin：下发随机挑战（payload: 32B 随机数） */
+    MSG_AUTH_RESPONSE = 17, /* client/admin → server：应答（payload: 32B HMAC） */
+    MSG_AUTH_OK = 18,       /* server → client/admin：认证通过 */
+    MSG_AUTH_FAIL = 19      /* server → client/admin：认证失败 */
 } msg_type_t;
 
 typedef struct {

@@ -49,24 +49,31 @@ length  = payload 长度（用于粘包处理：先读满 12 字节帧头，再�
 ### 1. 编译
 
 ```bash
-make          # 编译全部三个端
+make          # 编译全部三个端（server 支持 Linux/macOS）
 make clean    # 清理
 ```
+
+> server 的事件驱动后端按平台自动选择：Linux 用 epoll，macOS 用 kqueue。
+> HMAC 认证依赖：macOS 用系统自带 CommonCrypto（无需额外库），Linux 用 OpenSSL（需 `libssl-dev`，链接 `-lcrypto`）。
+> 单端编译：`make server` / `make client` / `make admin`。
 
 ### 2. 启动（需要开 3~4 个终端）
 
 ```bash
-# 终端 1: 启动服务端
+# 终端 1: 启动服务端（带 --secret 启用 admin 身份认证）
 make run-server
+# 或手动：./server/server 8888 --secret "your-secret"
 
-# 终端 2: 启动客户端 web-01
+# 终端 2: 启动客户端 web-01（client 无需认证）
 make run-client1
+# 或手动：./client/client 127.0.0.1 8888 web-01
 
 # 终端 3: 启动客户端 web-02（测试多台服务器）
 make run-client2
 
-# 终端 4: 启动管理端
+# 终端 4: 启动管理端（启用认证时必须带 -s）
 make run-admin
+# 或手动：./admin/admin -s "your-secret" 127.0.0.1 8888
 ```
 
 ### 3. 在管理端操作

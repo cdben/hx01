@@ -160,3 +160,26 @@ int set_nonblock(int fd)
 
     return 0;
 }
+
+int random_bytes(void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    while (got < len) {
+        ssize_t n = read(fd, p + got, len - got);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
